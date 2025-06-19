@@ -2,11 +2,11 @@ from pathlib import Path
 import argparse
 import re
 
-from aob import define_signature
-from binary_reader import BinaryReader
-from extractor import QtResourceInfo
-from pe_utils import PEUtils, PEHeader
-from signature_scanner import SignatureDefinition
+from .aob import define_signature
+from .binary_reader import BinaryReader
+from .extractor import QtResourceInfo
+from .pe_utils import PEUtils, PEHeader
+from .signature_scanner import SignatureDefinition
 
 
 def x86_extract(offset, bytes_, pe):
@@ -164,9 +164,9 @@ def parse_args():
   parser.add_argument('--datarva', type=str, help='[Advanced] Like --data, but offsets are RVAs')
   return parser.parse_args()
 
-def check_data_opt(pe, args):
-  data_arg = args.data or args.datarva
-  is_rva = args.datarva is not None
+def check_data_opt(pe, data=None, datarva=None):
+  data_arg = data or datarva
+  is_rva = datarva is not None
   if data_arg:
     m = re.match(r'([a-fA-F0-9]+),([a-fA-F0-9]+),([a-fA-F0-9]+),([0-9]+)', data_arg)
     if m:
@@ -181,12 +181,12 @@ def check_data_opt(pe, args):
       return [QtResourceInfo(-1, 0, offsets[0], offsets[1], offsets[2], version)]
   return None
 
-def get_target_section(pe, args):
-  if not args.scanall:
-    if args.section:
+def get_target_section(pe, scanall=False, section_name=None):
+  if not scanall:
+    if section_name:
       for section in pe.sections:
         name = section.Name.decode(errors='ignore').rstrip('\0')
-        if name == args.section:
+        if name == section_name:
           return section
     else:
       for section in pe.sections:
@@ -222,47 +222,86 @@ def ask_resource_data(buffer, pe, args, results):
       pass
     print(f'Please enter a number between 0 and {len(results)}')
 
-def main():
-  args = parse_args()
+def extract_qt_resources(filename,
+                         buffer=None,
+                         output=None,
+                         chunk=None, 
+                         scanall=False,
+                         section=None,
+                         data=None,
+                         datarva=None):
+    """
+    Extract Qt resources from a binary file. Returns a list of output paths for dumped resources.
+    Raises exceptions on error.
+    """
+    if filename is not None and buffer is None:
+      buffer = open(filename, 'rb').read()
+
+    pe = PEHeader(buffer)
+    output_directory = Path(output or 'qtextract-output')
+    output_directory.mkdir(exist_ok=True)
+    manual_chunks = check_data_opt(pe, data, datarva)
+    if manual_chunks:
+        to_dump = manual_chunks
+    else:
+        section_obj = get_target_section(pe, scanall, section)
+        if section_obj:
+            start = section_obj.PointerToRawData
+            end = start + section_obj.SizeOfRawData
+        else:
+            start = 0
+            end = len(buffer)
+        results = do_scan(buffer, start, end, pe)
+        to_dump = []
+        if chunk is not None:
+            if chunk == 0:
+                to_dump = results
+            elif 1 <= chunk <= len(results):
+                to_dump = [results[chunk - 1]]
+            else:
+                raise ValueError(f'Invalid chunk id: {chunk}')
+        else:
+            to_dump = results
+    output_paths = []
+    if to_dump:
+        for i, result in enumerate(to_dump):
+            dump_path = output_directory / str(i + 1) if len(to_dump) > 1 else output_directory
+            if len(to_dump) > 1:
+                dump_path.mkdir(exist_ok=True)
+            node = result.parse_node(buffer, 0)
+            if node:
+                node.dump(dump_path)
+                output_paths.append(str(dump_path))
+            else:
+                raise RuntimeError('Failed to parse node')
+    else:
+        raise RuntimeError('No chunks to dump')
+    return output_paths
+
+def cli_main(args=None):
+  if args is None:
+    args = parse_args()
   if args.help or not args.filename:
     print('''usage: qtextract filename [options]\noptions:\n  --help                   Print this help\n  --chunk chunk_id         The chunk to dump. Exclude this to see a list of chunks (if any can be found) and use 0 to dump all chunks\n  --output directory       For specifying an output directory\n  --scanall                Scan the entire file (instead of the first executable section)\n  --section section        For scanning a specific section\n  --data, --datarva info   [Advanced] Use these options to manually provide offsets to a qt resource in the binary\n                           (e.g. if no chunks were found automatically by qtextract).\n                           'info' should use the following format: %x,%x,%x,%d\n                           where the first 3 hexadecimal values are offsets to data, names, and tree\n                           and the last decimal value is the version (usually 1-3).\n\n                           If '--datarva' is used, provide RVA values (offsets from the image base) instead of file offsets.\n                           See check_data_opt() in main.rs for an example on finding these offsets using IDA.''')
     return
-  path = args.filename
-  buffer = open(path, 'rb').read()
-  pe = PEHeader(buffer)
-  output_directory = Path(args.output or 'qtextract-output')
-  output_directory.mkdir(exist_ok=True)
-  # Manual data option
-  manual_chunks = check_data_opt(pe, args)
-  if manual_chunks:
-    to_dump = manual_chunks
-  else:
-    section = get_target_section(pe, args)
-    if section:
-      start = section.PointerToRawData
-      end = start + section.SizeOfRawData
-      print(f'Scanning section {section.Name.decode(errors="ignore").rstrip(chr(0))} (0x{start:08X}-0x{end:08X})...')
-    else:
-      start = 0
-      end = len(buffer)
-      print('Scanning file...')
-    results = do_scan(buffer, start, end, pe)
-    print('Done.')
-    to_dump = ask_resource_data(buffer, pe, args, results)
-  if to_dump:
-    for i, result in enumerate(to_dump):
-      print(f'Extracting chunk #{i+1} (0x{result.registrar:08X})... ', end='')
-      dump_path = output_directory / str(i + 1) if len(to_dump) > 1 else output_directory
-      if len(to_dump) > 1:
-        dump_path.mkdir(exist_ok=True)
-      node = result.parse_node(buffer, 0)
-      if node:
-        print('OK')
-        node.dump(dump_path)
-      else:
-        print('ERROR (failed to parse node)')
-  else:
-    print('No chunks to dump')
+  try:
+    output_paths = extract_qt_resources(
+      filename=args.filename,
+      output=args.output,
+      chunk=args.chunk,
+      scanall=args.scanall,
+      section=args.section,
+      data=args.data,
+      datarva=args.datarva
+    )
+    for i, path in enumerate(output_paths):
+      print(f'Extracted chunk #{i+1} to: {path}')
+  except Exception as e:
+    print(f'Error: {e}')
+
+def main():
+  args = parse_args()
+  cli_main(args)
 
 if __name__ == "__main__":
   main()

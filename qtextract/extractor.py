@@ -3,7 +3,7 @@ import zlib
 from typing import Optional, List, Tuple, Union
 from pathlib import Path
 
-from binary_reader import BinaryReader
+from .binary_reader import BinaryReader
 
 
 class QtNodeAuxDirectory:

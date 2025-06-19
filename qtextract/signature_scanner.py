@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from aob import Signature
+from .aob import Signature
 
 
 class SignatureDefinition:
